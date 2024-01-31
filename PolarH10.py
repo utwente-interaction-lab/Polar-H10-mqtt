@@ -4,6 +4,11 @@ import time
 import numpy as np
 import math
 
+import random
+import time
+
+from paho.mqtt import client as mqtt_client
+
 class PolarH10:
     ## HEART RATE SERVICE
     HEART_RATE_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
@@ -57,7 +62,7 @@ class PolarH10:
     ACC_SAMPLING_FREQ = 200
     ECG_SAMPLING_FREQ = 130
 
-    def __init__(self, bleak_device):
+    def __init__(self, bleak_device, client_mqtt):
         self.bleak_device = bleak_device
         self.acc_stream_values = []
         self.acc_stream_times = []
@@ -68,104 +73,20 @@ class PolarH10:
         self.ecg_stream_times = []
         self.acc_data = None
         self.ibi_data = None
+        self.client_mqtt = client_mqtt
     
-    def hr_data_conv(self, sender, data):  
-        """
-        `data` is formatted according to the GATT Characteristic and Object Type 0x2A37 Heart Rate Measurement which is one of the three characteristics included in the "GATT Service 0x180D Heart Rate".
-        `data` can include the following bytes:
-        - flags
-            Always present.
-            - bit 0: HR format (uint8 vs. uint16)
-            - bit 1, 2: sensor contact status
-            - bit 3: energy expenditure status
-            - bit 4: RR interval status
-        - HR
-            Encoded by one or two bytes depending on flags/bit0. One byte is always present (uint8). Two bytes (uint16) are necessary to represent HR > 255.
-        - energy expenditure
-            Encoded by 2 bytes. Only present if flags/bit3.
-        - inter-beat-intervals (IBIs)
-            One IBI is encoded by 2 consecutive bytes. Up to 18 bytes depending on presence of uint16 HR format and energy expenditure.
-        """
+    def hr_data_mqtt_stream(self, sender, data):
         byte0 = data[0] # heart rate format
         uint8_format = (byte0 & 1) == 0
-        energy_expenditure = ((byte0 >> 3) & 1) == 1
-        rr_interval = ((byte0 >> 4) & 1) == 1
 
-        if not rr_interval:
-            return
-
-        first_rr_byte = 2
         if uint8_format:
             hr = data[1]
             pass
         else:
             hr = (data[2] << 8) | data[1] # uint16
-            first_rr_byte += 1
-        
-        if energy_expenditure:
-            # ee = (data[first_rr_byte + 1] << 8) | data[first_rr_byte]
-            first_rr_byte += 2
 
-        for i in range(first_rr_byte, len(data), 2):
-            ibi = (data[i + 1] << 8) | data[i]
-            # Polar H7, H9, and H10 record IBIs in 1/1024 seconds format.
-            # Convert 1/1024 sec format to milliseconds.
-            # TODO: move conversion to model and only convert if sensor doesn't
-            # transmit data in milliseconds.
-            ibi = np.ceil(ibi / 1024 * 1000)
-            self.ibi_stream_values.extend([ibi])
-            self.ibi_stream_times.extend([time.time_ns()/1.0e9])
-            
-    def acc_data_conv(self, sender, data): 
-    # [02 EA 54 A2 42 8B 45 52 08 01 45 FF E4 FF B5 03 45 FF E4 FF B8 03 ...]
-    # 02=ACC, 
-    # EA 54 A2 42 8B 45 52 08 = last sample timestamp in nanoseconds, 
-    # 01 = ACC frameType, 
-    # sample0 = [45 FF E4 FF B5 03] x-axis(45 FF=-184 millig) y-axis(E4 FF=-28 millig) z-axis(B5 03=949 millig) , 
-    # sample1, sample2,
-
-        if data[0] == 0x02:
-            if not bool(self.acc_stream_values):
-                self.acc_stream_start_time = time.time_ns()/1.0e9
-            
-            timestamp = PolarH10.convert_to_unsigned_long(data, 1, 8)/1.0e9 # timestamp of the last sample
-            frame_type = data[9]
-            resolution = (frame_type + 1) * 8 # 16 bit
-            time_step = 0.005 # 200 Hz sample rate
-            step = math.ceil(resolution / 8.0)
-            samples = data[10:] 
-            n_samples = math.floor(len(samples)/(step*3))
-            sample_timestamp = timestamp - (n_samples-1)*time_step
-            offset = 0
-            while offset < len(samples):
-                x = PolarH10.convert_array_to_signed_int(samples, offset, step)
-                offset += step
-                y = PolarH10.convert_array_to_signed_int(samples, offset, step) 
-                offset += step
-                z = PolarH10.convert_array_to_signed_int(samples, offset, step) 
-                offset += step
-                # mag = np.linalg.norm([x, y, z])
-                self.acc_stream_values.extend([[x, y, z]])
-                self.acc_stream_times.extend([sample_timestamp])
-                sample_timestamp += time_step
-    
-    def ecg_data_conv(self, sender, data):
-    # [00 EA 1C AC CC 99 43 52 08 00 68 00 00 58 00 00 46 00 00 3D 00 00 32 00 00 26 00 00 16 00 00 04 00 00 ...]
-    # 00 = ECG; EA 1C AC CC 99 43 52 08 = last sample timestamp in nanoseconds; 00 = ECG frameType, sample0 = [68 00 00] microVolts(104) , sample1, sample2, ....
-        if data[0] == 0x00:
-            timestamp = PolarH10.convert_to_unsigned_long(data, 1, 8)/1.0e9
-            step = 3
-            time_step = 1.0/ self.ECG_SAMPLING_FREQ
-            samples = data[10:]
-            n_samples = math.floor(len(samples)/step)
-            offset = 0
-            sample_timestamp = timestamp - (n_samples-1)*time_step
-            while offset < len(samples):
-                ecg = PolarH10.convert_array_to_signed_int(samples, offset, step)       
-                offset += step
-                self.ecg_stream_values.extend([ecg])
-                self.ecg_stream_times.extend([sample_timestamp])
-                sample_timestamp += time_step
+        print("published hr=" + str(hr), flush=True)
+        self.client_mqtt.publish("h10/hr", "{\"timeStamp\":" + str(int(time.time_ns()/10e6)) + ",\"hr\":" + str(hr) + "}")
 
     @staticmethod
     def convert_array_to_signed_int(data, offset, length):
@@ -206,35 +127,10 @@ class PolarH10:
             f"Hardware Revision: {BLUE}{''.join(map(chr, self.hardware_revision))}{RESET}\n"
             f"Software Revision: {BLUE}{''.join(map(chr, self.software_revision))}{RESET}")
 
-    async def start_acc_stream(self):
-        await self.bleak_client.write_gatt_char(PolarH10.PMD_CHAR1_UUID, PolarH10.ACC_WRITE, response=True)
-        await self.bleak_client.start_notify(PolarH10.PMD_CHAR2_UUID, self.acc_data_conv)
-        print("Collecting ACC data...", flush=True)
-
-    async def stop_acc_stream(self):
-        await self.bleak_client.stop_notify(PolarH10.PMD_CHAR2_UUID)
-        print("Stopping ACC data...", flush=True)
-
     async def start_hr_stream(self):
-        await self.bleak_client.start_notify(PolarH10.HEART_RATE_MEASUREMENT_UUID, self.hr_data_conv)
+        await self.bleak_client.start_notify(PolarH10.HEART_RATE_MEASUREMENT_UUID, self.hr_data_mqtt_stream)
         print("Collecting HR data...", flush=True)
 
     async def stop_hr_stream(self):
         await self.bleak_client.stop_notify(PolarH10.HEART_RATE_MEASUREMENT_UUID)
         print("Stopping HR data...", flush=True)
-    
-    def get_acc_data(self):
-        
-        acc_times = np.array(self.acc_stream_times)
-        acc_times = acc_times - acc_times[0] # rel to start of acc session
-        self.acc_data = {'times': acc_times, 'values': np.array(self.acc_stream_values)}
-
-        return self.acc_data
-    
-    def get_ibi_data(self):
-
-        ibi_times = np.array(self.ibi_stream_times)
-        ibi_times = ibi_times - self.acc_stream_start_time # rel to start of acc session time in unix s
-        self.ibi_data = {'times': ibi_times, 'values': np.array(self.ibi_stream_values)}
-
-        return self.ibi_data
