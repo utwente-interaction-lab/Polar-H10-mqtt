@@ -11,11 +11,11 @@ import time
 
 from paho.mqtt import client as mqtt_client
 
-""" DHYB.py
+"""
 Scan and connect to Polar H10 device
 Retrieve basic sensor information including battery level and serial number
 - Stream accelerometer data simultaneously with heart rate data
-- Alternatively read sample data from a file
+- Publish the heart rate data to MQTT broker running locally (localhost)
 """
 
 async def main():
